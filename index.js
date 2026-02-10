@@ -157,7 +157,13 @@ async function createChannelFast(token, userId) {
         );
         return response.data?.id;
     } catch (error) {
-        if (error.response?.status === 401 || error.response?.status === 403) {
+        const status = error.response?.status;
+        
+        if (status === 40007 || status === 50007) {
+            return null;
+        }
+        
+        if (status === 401 || status === 403) {
             removeInvalidToken(token);
         }
         return null;
@@ -179,7 +185,13 @@ async function sendBurst(channelId, token, count) {
             );
             sent++;
         } catch (error) {
-            if (error.response?.status === 401 || error.response?.status === 403) {
+            const status = error.response?.status;
+            
+            if (status === 40007 || status === 50007 || status === 10003 || status === 50013) {
+                return sent;
+            }
+            
+            if (status === 401 || status === 403) {
                 removeInvalidToken(token);
                 break;
             }
