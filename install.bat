@@ -9,7 +9,7 @@ if not exist package.json (
 )
 
 echo [+] Installing dependencies...
-npm install discord.js axios
+npm install discord.js axios uuid debug ws
 
 echo [+] Installation completed!
 pause
