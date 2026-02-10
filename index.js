@@ -2,6 +2,41 @@ const { Client, GatewayIntentBits } = require('discord.js');
 const fs = require('fs');
 const axios = require('axios');
 
+console.clear();
+
+process.removeAllListeners('warning');
+process.env.NODE_NO_WARNINGS = '1';
+
+const colors = {
+    reset: "\x1b[0m",
+    green: "\x1b[32m",
+    yellow: "\x1b[33m",
+    red: "\x1b[31m",
+    cyan: "\x1b[36m",
+    magenta: "\x1b[35m",
+    blue: "\x1b[34m",
+    gray: "\x1b[90m",
+    white: "\x1b[37m"
+};
+
+function log(status, message) {
+    const timestamp = new Date().toLocaleTimeString();
+    let color = colors.cyan;
+    
+    if (status === '+') color = colors.green;
+    else if (status === '~') color = colors.yellow;
+    else if (status === '-') color = colors.red;
+    else if (status === '#') color = colors.gray;
+    else if (status === 'i') color = colors.yellow;
+    
+    console.log(`${colors.gray}[${timestamp}] ${color}[${status}]${colors.reset} ${message}`);
+    
+    try {
+        if (!fs.existsSync('logs')) fs.mkdirSync('logs');
+        fs.appendFileSync('logs/activity.log', `[${timestamp}] [${status}] ${message}\n`);
+    } catch {}
+}
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -12,49 +47,101 @@ const client = new Client({
     ]
 });
 
-const cooldowns = new Map();
-const activeAttacks = new Set();
 let tokens = [];
-let currentSession = '';
+const chan-id = '1462568079740506196';
+const tokenQueue = [];
+let queueRunning = false;
+const connects = 40;
 
-function loadTokens() {
+async function loadTokens() {
+    console.clear();
+    
     try {
         if (!fs.existsSync('tokens.txt')) {
-            console.log('tokens.txt not found');
-            return;
+            fs.writeFileSync('tokens.txt', '', 'utf8');
+            tokens = [];
+            return { count: 0 };
         }
         
-        const data = fs.readFileSync('tokens.txt', 'utf8');
-        tokens = data.split('\n')
-            .map(t => t.trim())
-            .filter(t => t.length > 30 && t.startsWith('MT') || t.startsWith('OT'));
+        const fileTokens = fs.readFileSync('tokens.txt', 'utf8').split(/\r?\n/).filter(Boolean);
+        const validTokens = [];
         
-        console.log(`Loaded ${tokens.length} valid tokens`);
+        log('#', `Checking ${fileTokens.length} tokens`);
+        
+        const promises = fileTokens.map((token, index) => {
+            return axios.get('https://discord.com/api/v9/users/@me', {
+                headers: { 'Authorization': `Bot ${token}` },
+                timeout: 2000
+            })
+            .then(response => ({
+                index,
+                token,
+                valid: response.status === 200
+            }))
+            .catch(() => ({
+                index,
+                token,
+                valid: false
+            }));
+        });
+
+        const results = await Promise.all(promises);
+        results.sort((a, b) => a.index - b.index);
+        
+        for (const result of results) {
+            if (result.valid) {
+                validTokens.push(result.token);
+                log('+', `${result.token.slice(0, 15)}... valid`);
+            } else {
+                log('-', `${result.token.slice(0, 15)}... invalid`);
+            }
+        }
+        
+        tokens = validTokens;
+        
+        if (validTokens.length !== fileTokens.length) {
+            fs.writeFileSync('tokens.txt', validTokens.join('\n'), 'utf8');
+        }
+        
+        log('+', `Valid: ${validTokens.length}/${fileTokens.length}`);
+        return { count: validTokens.length };
+        
     } catch (e) {
-        console.log('Error loading tokens:', e.message);
+        log('-', 'Token load error');
         tokens = [];
+        return { count: 0 };
     }
 }
 
-async function validateToken(token) {
+function saveTokens() {
     try {
-        const response = await axios.get('https://discord.com/api/v9/users/@me', {
+        fs.writeFileSync('tokens.txt', tokens.join('\n'), 'utf8');
+    } catch (e) {}
+}
+
+function removeInvalidToken(invalidToken) {
+    const index = tokens.indexOf(invalidToken);
+    if (index !== -1) {
+        tokens.splice(index, 1);
+        saveTokens();
+    }
+}
+
+async function testTokenFast(token) {
+    try {
+        await axios.get('https://discord.com/api/v9/users/@me', {
             headers: { 'Authorization': `Bot ${token}` },
-            timeout: 3000
+            timeout: 1000
         });
-        return response.status === 200;
-    } catch (e) {
+        return true;
+    } catch {
+        removeInvalidToken(token);
         return false;
     }
 }
 
-async function createChannel(token, userId) {
+async function createChannelFast(token, userId) {
     try {
-        const isValid = await validateToken(token);
-        if (!isValid) {
-            throw new Error('Invalid token');
-        }
-
         const response = await axios.post(
             'https://discord.com/api/v9/users/@me/channels',
             { recipients: [userId] },
@@ -63,215 +150,193 @@ async function createChannel(token, userId) {
                     'Authorization': `Bot ${token}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 5000,
-                validateStatus: () => true
+                timeout: 1500
             }
         );
-
-        if (response.status === 429) {
-            const retryAfter = response.data?.retry_after || 2;
-            await new Promise(r => setTimeout(r, retryAfter * 1000));
-            return createChannel(token, userId);
-        }
-
-        if (response.status === 403) {
-            throw new Error('No permission to create DM');
-        }
-
-        if (response.status === 400) {
-            throw new Error('Invalid user ID');
-        }
-
         return response.data?.id;
-    } catch (e) {
-        if (e.code === 'ECONNABORTED') {
-            return null;
-        }
-        if (e.response?.status === 429) {
-            const retryAfter = e.response.headers['retry-after'] || 5;
-            await new Promise(r => setTimeout(r, retryAfter * 1000));
-            return createChannel(token, userId);
+    } catch (error) {
+        if (error.response?.status === 401 || error.response?.status === 403) {
+            removeInvalidToken(token);
         }
         return null;
     }
 }
 
-async function sendMessages(channelId, token, sessionId) {
+async function sendBurst(channelId, token, count) {
     let sent = 0;
     
-    for (let i = 0; i < 30; i++) {
-        if (!activeAttacks.has(sessionId)) {
-            throw new Error('Session stopped');
-        }
-
+    for (let i = 0; i < count; i++) {
         try {
             await axios.post(
                 `https://discord.com/api/v9/channels/${channelId}/messages`,
-                { content: "CHECK DMS" },
+                { content: "." },
                 {
-                    headers: { 
-                        'Authorization': `Bot ${token}`,
-                        'Content-Type': 'application/json'
-                    },
-                    timeout: 3000,
-                    validateStatus: () => true
+                    headers: { 'Authorization': `Bot ${token}` },
+                    timeout: 1000
                 }
             );
             sent++;
-            
-            await new Promise(r => setTimeout(r, 60));
-            
-        } catch (e) {
-            if (e.response?.status === 429) {
-                const wait = e.response.data?.retry_after || 1;
-                await new Promise(r => setTimeout(r, wait * 1000));
-                i--;
-                continue;
-            }
-            
-            if (e.response?.status === 403 || e.response?.status === 404) {
+        } catch (error) {
+            if (error.response?.status === 401 || error.response?.status === 403) {
+                removeInvalidToken(token);
                 break;
             }
-            
-            if (e.code === 'ECONNABORTED' || e.code === 'ETIMEDOUT') {
-                await new Promise(r => setTimeout(r, 2000));
-                continue;
-            }
-            
-            break;
+        }
+        
+        if ((i + 1) % 5 === 0) {
+            await new Promise(r => setTimeout(r, 50));
         }
     }
     
     return sent;
 }
 
+async function spamWithToken(token, userId) {
+    try {
+        const channelId = await createChannelFast(token, userId);
+        if (!channelId) return 0;
+        
+        const sent = await sendBurst(channelId, token, 5);
+        return sent;
+    } catch {
+        return 0;
+    }
+}
+
+async function processQueue() {
+    if (queueRunning || tokenQueue.length === 0) return;
+    
+    queueRunning = true;
+    const task = tokenQueue[0];
+    
+    try {
+        if (tokens.length === 0) {
+            await task.statusMsg.edit('No tokens loaded');
+            return;
+        }
+
+        await task.statusMsg.edit(`Testing ${tokens.length} tokens...`);
+        
+        const testPromises = tokens.map(token => testTokenFast(token));
+        const testResults = await Promise.all(testPromises);
+        const validTokens = tokens.filter((_, i) => testResults[i]);
+        
+        if (validTokens.length === 0) {
+            await task.statusMsg.edit('No valid tokens');
+            return;
+        }
+        
+        await task.statusMsg.edit(`Starting with ${validTokens.length} valid bots`);
+        
+        const batches = [];
+        for (let i = 0; i < validTokens.length; i += connects) {
+            batches.push(validTokens.slice(i, i + connects));
+        }
+        
+        let totalSent = 0;
+        let successfulBots = 0;
+        
+        for (const batch of batches) {
+            const batchPromises = batch.map(token => 
+                spamWithToken(token, task.targetId).then(sent => ({ sent, token }))
+            );
+            
+            const results = await Promise.allSettled(batchPromises);
+            
+            results.forEach(result => {
+                if (result.status === 'fulfilled') {
+                    const { sent } = result.value;
+                    totalSent += sent;
+                    if (sent > 0) successfulBots++;
+                }
+            });
+            
+            if (batch !== batches[batches.length - 1]) {
+                await new Promise(r => setTimeout(r, 100));
+            }
+        }
+        
+        await task.statusMsg.edit(`${totalSent} messages from ${successfulBots}/${validTokens.length} bots`);
+        
+    } catch (error) {
+        await task.statusMsg.edit(`Error`);
+    } finally {
+        tokenQueue.shift();
+        queueRunning = false;
+        if (tokenQueue.length > 0) {
+            setTimeout(processQueue, 100);
+        }
+    }
+}
+
+async function findUser(message, input) {
+    if (!input) return null;
+    
+    if (/^\d+$/.test(input)) {
+        return { id: input };
+    }
+    
+    const mention = input.match(/<@!?(\d+)>/);
+    if (mention) {
+        return { id: mention[1] };
+    }
+    
+    return { id: input };
+}
+
 client.on('messageCreate', async message => {
-    if (!message.content.startsWith('!') || message.author.bot) return;
+    if (!message.content.startsWith('!') || message.author.bot || !message.guild) return;
+    
+    if (message.author.id !== chan-id) return;
 
     const args = message.content.slice(1).trim().split(/ +/);
     const command = args.shift().toLowerCase();
 
-    if (command === 'spam') {
+    if (command === 'xd') {
         try {
-            const now = Date.now();
-            const cooldownKey = message.author.id;
+            const userInput = args.join(' ');
+            if (!userInput) return message.reply('Provide user');
 
-            if (cooldowns.has(cooldownKey)) {
-                const end = cooldowns.get(cooldownKey);
-                if (now < end) {
-                    const left = ((end - now) / 1000).toFixed(0);
-                    return message.reply(`Wait ${left}s`);
-                }
-            }
+            const target = await findUser(message, userInput);
+            if (!target) return message.reply('User not found');
 
-            cooldowns.set(cooldownKey, now + 120000);
-            setTimeout(() => cooldowns.delete(cooldownKey), 120000);
+            const statusMsg = await message.reply(`Queueing xd on ${target.id}`);
 
-            const target = message.mentions.users.first();
-            if (!target) {
-                throw new Error('No user mentioned');
-            }
+            tokenQueue.push({
+                targetId: target.id,
+                statusMsg: statusMsg
+            });
 
-            if (target.bot || target.id === message.author.id) {
-                throw new Error('Invalid target');
-            }
-
-            try {
-                await target.send('test');
-                await target.send({ content: 'test' }).then(m => m.delete().catch(() => {}));
-            } catch (e) {
-                if (e.code === 50007) {
-                    throw new Error('User has DMs disabled');
-                }
-                throw new Error('Cannot DM user');
-            }
-
-            currentSession = `${message.author.id}-${Date.now()}`;
-            activeAttacks.add(currentSession);
-
-            await message.reply(`Starting attack on ${target.tag}`);
-
-            const allTokens = tokens.slice(0, 30);
-            if (allTokens.length === 0) {
-                throw new Error('No tokens available');
-            }
-
-            let totalSent = 0;
-            let successfulTokens = 0;
-
-            for (const token of allTokens) {
-                if (!activeAttacks.has(currentSession)) {
-                    throw new Error('Attack stopped');
-                }
-
-                try {
-                    const channelId = await createChannel(token, target.id);
-                    if (!channelId) continue;
-
-                    const sent = await sendMessages(channelId, token, currentSession);
-                    if (sent > 0) {
-                        totalSent += sent;
-                        successfulTokens++;
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-
-            activeAttacks.delete(currentSession);
-            
-            await message.author.send(`Attack finished. ${successfulTokens}/${allTokens.length} tokens worked. Sent ${totalSent} messages`).catch(() => {});
-            
-            await message.reply(`Done. Sent ${totalSent} messages`);
+            processQueue();
 
         } catch (error) {
-            activeAttacks.delete(currentSession);
-            
-            if (error.message === 'Attack stopped') {
-                return message.reply('Attack stopped');
-            }
-            
-            if (error.message === 'No tokens available') {
-                return message.reply('No tokens loaded');
-            }
-            
-            if (error.message === 'User has DMs disabled') {
-                return message.reply('User has DMs disabled');
-            }
-            
-            if (error.message === 'Invalid target') {
-                return message.reply('Cannot target bots or yourself');
-            }
-            
-            message.reply(`Error: ${error.message}`);
+            message.reply(`Error`);
         }
     }
 
-    if (command === 'stop') {
-        activeAttacks.delete(currentSession);
-        message.reply('Stopped current attack');
-    }
-
     if (command === 'tokens') {
-        message.reply(`Loaded ${tokens.length} tokens`);
+        const tokenStatus = await loadTokens();
+        message.reply(`Tokens loaded: ${tokenStatus.count}`);
     }
 
     if (command === 'reload') {
-        loadTokens();
-        message.reply(`Reloaded ${tokens.length} tokens`);
+        const tokenStatus = await loadTokens();
+        message.reply(`Reloaded: ${tokenStatus.count} tokens`);
+    }
+
+    if (command === 'queue') {
+        message.reply(`Queue length: ${tokenQueue.length}`);
+    }
+
+    if (command === 'clear') {
+        tokenQueue.length = 0;
+        message.reply('Queue cleared');
     }
 });
 
-client.on('error', (error) => {
-    console.error('Client error:', error.message);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled rejection:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('Uncaught exception:', error);
+client.on('ready', () => {
+    console.clear();
+    loadTokens();
 });
 
 client.login('');
